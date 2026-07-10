@@ -28,15 +28,27 @@
  *     headers: { "Content-Type": "application/json" },
  *     body: JSON.stringify({ side: "buy", secret: "your-trigger-secret" })
  *   })
+ *
+ * ALSO EXPOSES:
+ *   GET /prices   returns recent MNQ price ticks for a simple live chart.
+ *   The JWT that can place trades never leaves this server -- the page
+ *   only ever receives plain price numbers, nothing that can trade.
+ *   The feed connection to TopstepX (same one tick_recorder.py uses) is
+ *   started lazily on the first /prices request and stopped automatically
+ *   after 2 minutes of no polling, so it doesn't run unattended.
  */
 
 const express = require("express");
 const cors = require("cors");
+const signalR = require("@microsoft/signalr");
 
 const app = express();
 app.use(express.json());
 
 const BASE_URL = "https://api.topstepx.com/api";
+const MARKET_HUB_URL = "https://rtc.topstepx.com/hubs/market";
+const PRICE_BUFFER_MAX = 300; // keep roughly the last few minutes of ticks
+const FEED_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // stop the feed after 2 min of no polling
 
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
@@ -150,6 +162,82 @@ app.post("/trade", async (req, res) => {
     });
   } catch (err) {
     console.error("[ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------- live price feed (for the chart) ----------
+// Reuses the exact same TopstepX live trade feed tick_recorder.py already
+// connects to -- just relayed from the backend instead of saved to a CSV.
+// The page only ever gets { t, price } numbers, never the trading token.
+let priceBuffer = []; // [{ t: epochMs, price }]
+let feedConnection = null;
+let feedContractId = null;
+let feedIdleTimer = null;
+
+function resetFeedIdleTimer() {
+  if (feedIdleTimer) clearTimeout(feedIdleTimer);
+  feedIdleTimer = setTimeout(stopFeed, FEED_IDLE_TIMEOUT_MS);
+}
+
+async function stopFeed() {
+  if (!feedConnection) return;
+  try {
+    await feedConnection.send("UnsubscribeContractTrades", [feedContractId]);
+  } catch (_) {
+    /* best-effort -- we're tearing this down anyway */
+  }
+  try {
+    await feedConnection.stop();
+  } catch (_) {}
+  feedConnection = null;
+  console.log("[INFO] Price feed stopped (idle).");
+}
+
+async function ensureFeedRunning() {
+  if (feedConnection) return; // already connected
+
+  const token = await authenticate();
+  const contract = await findMnqContract(token);
+  feedContractId = contract.id;
+
+  const hub = new signalR.HubConnectionBuilder()
+    .withUrl(`${MARKET_HUB_URL}?access_token=${token}`)
+    .withAutomaticReconnect()
+    .build();
+
+  hub.on("GatewayTrade", (...args) => {
+    try {
+      const payload = args[args.length - 1];
+      const items = Array.isArray(payload) ? payload : [payload];
+      for (const item of items) {
+        if (item && typeof item.price === "number") {
+          priceBuffer.push({ t: Date.now(), price: item.price });
+        }
+      }
+      if (priceBuffer.length > PRICE_BUFFER_MAX) {
+        priceBuffer = priceBuffer.slice(-PRICE_BUFFER_MAX);
+      }
+    } catch (err) {
+      console.error("[WARN] Could not parse trade message:", err.message);
+    }
+  });
+
+  hub.onclose(() => console.log("[WARN] Price feed connection closed."));
+
+  await hub.start();
+  await hub.send("SubscribeContractTrades", [contract.id]);
+  feedConnection = hub;
+  console.log(`[OK] Price feed connected for ${contract.name}.`);
+}
+
+app.get("/prices", async (req, res) => {
+  try {
+    await ensureFeedRunning();
+    resetFeedIdleTimer();
+    res.json({ ok: true, prices: priceBuffer });
+  } catch (err) {
+    console.error("[ERROR] /prices:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
