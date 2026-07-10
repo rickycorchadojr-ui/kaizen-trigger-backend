@@ -334,49 +334,68 @@ async function stopFeed() {
   console.log("[INFO] Price feed stopped (idle).");
 }
 
+let feedConnectingPromise = null; // in-flight connection attempt, if any
+
 async function ensureFeedRunning() {
   if (feedConnection) return; // already connected
 
-  const token = await authenticate();
-  const contract = await findMnqContract(token);
-  feedContractId = contract.id;
+  // If a connection attempt is already in progress (e.g. a previous /prices
+  // poll kicked one off and hasn't finished settling yet -- connecting takes
+  // longer than the page's 3-second poll interval), wait for that same
+  // attempt instead of starting a second, competing connection. Without
+  // this, overlapping polls kept racing to open duplicate WebSocket
+  // connections before the first ever finished subscribing, so no single
+  // connection lived long enough to actually receive ticks.
+  if (feedConnectingPromise) return feedConnectingPromise;
 
-  const hub = new signalR.HubConnectionBuilder()
-    .withUrl(`${MARKET_HUB_URL}?access_token=${token}`)
-    .withAutomaticReconnect()
-    .build();
+  feedConnectingPromise = (async () => {
+    const token = await authenticate();
+    const contract = await findMnqContract(token);
+    feedContractId = contract.id;
 
-  hub.on("GatewayTrade", (...args) => {
-    try {
-      const payload = args[args.length - 1];
-      const items = Array.isArray(payload) ? payload : [payload];
-      for (const item of items) {
-        if (item && typeof item.price === "number") {
-          priceBuffer.push({ t: Date.now(), price: item.price });
+    const hub = new signalR.HubConnectionBuilder()
+      .withUrl(`${MARKET_HUB_URL}?access_token=${token}`)
+      .withAutomaticReconnect()
+      .build();
+
+    hub.on("GatewayTrade", (...args) => {
+      try {
+        const payload = args[args.length - 1];
+        const items = Array.isArray(payload) ? payload : [payload];
+        for (const item of items) {
+          if (item && typeof item.price === "number") {
+            priceBuffer.push({ t: Date.now(), price: item.price });
+          }
         }
+        if (priceBuffer.length > PRICE_BUFFER_MAX) {
+          priceBuffer = priceBuffer.slice(-PRICE_BUFFER_MAX);
+        }
+      } catch (err) {
+        console.error("[WARN] Could not parse trade message:", err.message);
       }
-      if (priceBuffer.length > PRICE_BUFFER_MAX) {
-        priceBuffer = priceBuffer.slice(-PRICE_BUFFER_MAX);
-      }
-    } catch (err) {
-      console.error("[WARN] Could not parse trade message:", err.message);
-    }
-  });
+    });
 
-  hub.onclose(() => console.log("[WARN] Price feed connection closed."));
+    hub.onclose(() => console.log("[WARN] Price feed connection closed."));
 
-  await hub.start();
+    await hub.start();
 
-  // Give the connection a moment to fully settle before subscribing --
-  // subscribing immediately after start() can look successful (the socket
-  // reports connected) while the subscription itself silently never
-  // registers server-side, so no ticks ever arrive. tick_recorder.py
-  // already found this the hard way and waits 2 seconds here too.
-  await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Give the connection a moment to fully settle before subscribing --
+    // subscribing immediately after start() can look successful (the socket
+    // reports connected) while the subscription itself silently never
+    // registers server-side, so no ticks ever arrive. tick_recorder.py
+    // already found this the hard way and waits 2 seconds here too.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
 
-  await hub.send("SubscribeContractTrades", [contract.id]);
-  feedConnection = hub;
-  console.log(`[OK] Price feed connected for ${contract.name}.`);
+    await hub.send("SubscribeContractTrades", [contract.id]);
+    feedConnection = hub;
+    console.log(`[OK] Price feed connected for ${contract.name}.`);
+  })();
+
+  try {
+    await feedConnectingPromise;
+  } finally {
+    feedConnectingPromise = null;
+  }
 }
 
 app.get("/prices", async (req, res) => {
