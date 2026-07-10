@@ -94,7 +94,7 @@ async function placeOrder(token, accountId, contractId, side, stopTicks, targetT
     stopPrice: null,
     trailPrice: null,
     customTag: `trigger-${Date.now()}`,
-    stopLossBracket: { ticks: -stopTicks, type: 4 },
+    stopLossBracket: { ticks: stopTicks, type: 4 },
     takeProfitBracket: { ticks: targetTicks, type: 1 },
   };
   const resp = await fetch(`${BASE_URL}/Order/place`, {
