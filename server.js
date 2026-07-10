@@ -153,6 +153,34 @@ async function cancelOpenOrdersForContract(token, accountId, contractId) {
   }
 }
 
+async function findOpenPositions(token, accountId) {
+  const resp = await fetch(`${BASE_URL}/Position/searchOpen`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ accountId }),
+  });
+  const data = await resp.json();
+  if (!data.success) throw new Error(`Position search failed: ${JSON.stringify(data)}`);
+  return data.positions || []; // each has .contractId, .type (1=long, 2=short), .size
+}
+
+async function closePosition(token, accountId, contractId) {
+  const resp = await fetch(`${BASE_URL}/Position/closeContract`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ accountId, contractId }),
+  });
+  const data = await resp.json();
+  if (!data.success) throw new Error(`Close position failed: ${JSON.stringify(data)}`);
+  return data;
+}
+
 async function placeOrder(token, accountId, contractId, side, stopTicks, targetTicks) {
   // Bracket tick signs are direction-dependent, not fixed:
   //   Buy (long):  stop loss negative, take profit positive
@@ -215,12 +243,41 @@ app.post("/trade", async (req, res) => {
     // leaves orphaned working orders sitting on the account.
     await cancelOpenOrdersForContract(token, accountId, contract.id);
 
+    const sideCode = side === "buy" ? 0 : 1;
+
+    // If there's already an open position on this contract and the tapped
+    // button is the opposite direction, the intent is to CLOSE that
+    // position, not open a fresh one. Use Position/closeContract for that --
+    // it flattens cleanly with no bracket attached, instead of placing
+    // another market order that would still get its own stop/target orders
+    // created even though the account nets back to flat.
+    const positions = await findOpenPositions(token, accountId);
+    const existingPosition = positions.find((p) => p.contractId === contract.id);
+
+    if (existingPosition) {
+      const positionIsLong = existingPosition.type === 1; // 1 = long, 2 = short
+      const tapIsOpposite =
+        (positionIsLong && sideCode === 1) || (!positionIsLong && sideCode === 0);
+
+      if (tapIsOpposite) {
+        await closePosition(token, accountId, contract.id);
+        console.log(
+          `[OK] Flattened existing ${positionIsLong ? "LONG" : "SHORT"} position via ${side.toUpperCase()} tap -- no new bracket placed.`
+        );
+        return res.json({
+          ok: true,
+          flattened: true,
+          side,
+          contract: contract.name,
+        });
+      }
+    }
+
     // Convert dollar risk into ticks using the contract's LIVE tick value,
     // so this stays correct even if the contract multiplier ever changes.
     const stopTicks = Math.round(stopDollars / contract.tickValue);
     const targetTicks = Math.round(targetDollars / contract.tickValue);
 
-    const sideCode = side === "buy" ? 0 : 1;
     const result = await placeOrder(
       token,
       accountId,
