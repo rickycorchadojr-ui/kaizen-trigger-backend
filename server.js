@@ -226,6 +226,14 @@ async function ensureFeedRunning() {
   hub.onclose(() => console.log("[WARN] Price feed connection closed."));
 
   await hub.start();
+
+  // Give the connection a moment to fully settle before subscribing --
+  // subscribing immediately after start() can look successful (the socket
+  // reports connected) while the subscription itself silently never
+  // registers server-side, so no ticks ever arrive. tick_recorder.py
+  // already found this the hard way and waits 2 seconds here too.
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
   await hub.send("SubscribeContractTrades", [contract.id]);
   feedConnection = hub;
   console.log(`[OK] Price feed connected for ${contract.name}.`);
