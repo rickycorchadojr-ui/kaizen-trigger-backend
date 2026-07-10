@@ -43,7 +43,8 @@ const cors = require("cors");
 const signalR = require("@microsoft/signalr");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+
 
 const BASE_URL = "https://api.topstepx.com/api";
 const MARKET_HUB_URL = "https://rtc.topstepx.com/hubs/market";
