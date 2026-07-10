@@ -84,6 +84,14 @@ async function findMnqContract(token) {
 }
 
 async function placeOrder(token, accountId, contractId, side, stopTicks, targetTicks) {
+  // Bracket tick signs are direction-dependent, not fixed:
+  //   Buy (long):  stop loss negative, take profit positive
+  //   Sell (short): stop loss positive, take profit negative
+  // (confirmed directly from TopstepX's own validation errors on each side)
+  const isBuy = side === 0;
+  const stopLossTicks = isBuy ? -stopTicks : stopTicks;
+  const takeProfitTicks = isBuy ? targetTicks : -targetTicks;
+
   const order = {
     accountId,
     contractId,
@@ -94,8 +102,8 @@ async function placeOrder(token, accountId, contractId, side, stopTicks, targetT
     stopPrice: null,
     trailPrice: null,
     customTag: `trigger-${Date.now()}`,
-    stopLossBracket: { ticks: stopTicks, type: 4 },
-    takeProfitBracket: { ticks: targetTicks, type: 1 },
+    stopLossBracket: { ticks: stopLossTicks, type: 4 },
+    takeProfitBracket: { ticks: takeProfitTicks, type: 1 },
   };
   const resp = await fetch(`${BASE_URL}/Order/place`, {
     method: "POST",
