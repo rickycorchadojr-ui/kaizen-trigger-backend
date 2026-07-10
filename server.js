@@ -50,6 +50,18 @@ const MARKET_HUB_URL = "https://rtc.topstepx.com/hubs/market";
 const PRICE_BUFFER_MAX = 300; // keep roughly the last few minutes of ticks
 const FEED_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // stop the feed after 2 min of no polling
 
+const ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages";
+const ANALYSIS_MODEL = "claude-sonnet-5";
+const ANALYSIS_SYSTEM_PROMPT = `You are a discretionary futures trader looking at a screenshot of an MNQ (Micro Nasdaq) chart. Read the structure shown -- recent swing highs/lows, any breakout or rejection candles, and where price sits relative to those levels right now.
+
+Give a concrete, opinionated read, not a hedge. Structure your response as:
+
+1. Chart read: what the structure actually shows (2-4 sentences)
+2. Trade: Long or Short, with a specific entry, stop, and 1-2 targets in price terms
+3. Invalidation: the specific level/behavior that proves this read wrong
+
+Keep it tight -- this is a fast discretionary read, not a research report. If price action is genuinely directionless, say so plainly instead of forcing a trade idea.`;
+
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
@@ -274,6 +286,69 @@ app.post("/trade", async (req, res) => {
     });
   } catch (err) {
     console.error("[ERROR]", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/analyze", async (req, res) => {
+  try {
+    const { image, mediaType, secret, note } = req.body || {};
+
+    if (secret !== process.env.TRIGGER_SECRET) {
+      return res.status(401).json({ error: "Invalid secret." });
+    }
+    if (!image) {
+      return res.status(400).json({ error: "image (base64) is required." });
+    }
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(500).json({ error: "ANTHROPIC_API_KEY not set on server." });
+    }
+
+    const userContent = [
+      {
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: mediaType || "image/png",
+          data: image,
+        },
+      },
+      {
+        type: "text",
+        text: note
+          ? `Read this chart. Additional context from me: ${note}`
+          : "Read this chart and give me a trade.",
+      },
+    ];
+
+    const resp = await fetch(ANTHROPIC_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": process.env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: ANALYSIS_MODEL,
+        max_tokens: 700,
+        system: ANALYSIS_SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userContent }],
+      }),
+    });
+
+    const data = await resp.json();
+    if (!resp.ok) {
+      throw new Error(data.error?.message || `Anthropic API error (${resp.status})`);
+    }
+
+    const text = (data.content || [])
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    res.json({ ok: true, analysis: text });
+  } catch (err) {
+    console.error("[ERROR] /analyze:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
