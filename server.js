@@ -53,7 +53,18 @@ const FEED_IDLE_TIMEOUT_MS = 2 * 60 * 1000; // stop the feed after 2 min of no p
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 app.use(cors({ origin: ALLOWED_ORIGIN }));
 
-async function authenticate() {
+// ---------- token caching ----------
+// TopstepX sessions last 24 hours, but calling loginKey fresh every time
+// (every trade, every feed reconnect) creates a brand-new login session
+// each time -- and TopstepX enforces single-session login, so each new
+// backend session was silently kicking your phone app's session out.
+// Fix: log in once, cache the token, and reuse it well within its 24hr
+// window instead of generating a new session per action.
+const TOKEN_TTL_MS = 20 * 60 * 60 * 1000; // refresh comfortably before 24hr expiry
+let cachedToken = null;
+let cachedTokenAt = 0;
+
+async function loginKey() {
   const resp = await fetch(`${BASE_URL}/Auth/loginKey`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -65,6 +76,17 @@ async function authenticate() {
   const data = await resp.json();
   if (!data.success) throw new Error(`Auth failed: ${JSON.stringify(data)}`);
   return data.token;
+}
+
+async function authenticate() {
+  const now = Date.now();
+  if (cachedToken && now - cachedTokenAt < TOKEN_TTL_MS) {
+    return cachedToken;
+  }
+  cachedToken = await loginKey();
+  cachedTokenAt = now;
+  console.log("[OK] New TopstepX session started (cached for reuse).");
+  return cachedToken;
 }
 
 async function findMnqContract(token) {
@@ -81,6 +103,54 @@ async function findMnqContract(token) {
   const contracts = (data.contracts || []).filter((c) => c.activeContract);
   if (!contracts.length) throw new Error("No active MNQ contract found.");
   return contracts[0]; // has .id, .tickSize, .tickValue
+}
+
+async function findOpenOrders(token, accountId) {
+  const resp = await fetch(`${BASE_URL}/Order/searchOpen`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ accountId }),
+  });
+  const data = await resp.json();
+  if (!data.success) throw new Error(`Order search failed: ${JSON.stringify(data)}`);
+  return data.orders || [];
+}
+
+async function cancelOrder(token, accountId, orderId) {
+  const resp = await fetch(`${BASE_URL}/Order/cancel`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ accountId, orderId }),
+  });
+  const data = await resp.json();
+  if (!data.success) throw new Error(`Cancel order ${orderId} failed: ${JSON.stringify(data)}`);
+  return data;
+}
+
+// Cancels any leftover working orders (stop loss / take profit brackets)
+// left behind by a previous trade. Placing a market order to flatten or
+// reverse a position fills against the position, but it does NOT touch
+// the bracket's separate stop/limit orders -- they keep sitting there
+// unless explicitly canceled. Called right before every new trade so
+// each Buy/Sell always starts from a clean slate.
+async function cancelOpenOrdersForContract(token, accountId, contractId) {
+  const openOrders = await findOpenOrders(token, accountId);
+  const toCancel = openOrders.filter((o) => o.contractId === contractId);
+  for (const o of toCancel) {
+    try {
+      await cancelOrder(token, accountId, o.id);
+      console.log(`[OK] Canceled leftover order ${o.id} before new trade.`);
+    } catch (err) {
+      // Don't let a cancel failure block the new trade -- log it and move on.
+      console.error(`[WARN] Could not cancel order ${o.id}:`, err.message);
+    }
+  }
 }
 
 async function placeOrder(token, accountId, contractId, side, stopTicks, targetTicks) {
@@ -139,6 +209,11 @@ app.post("/trade", async (req, res) => {
 
     const token = await authenticate();
     const contract = await findMnqContract(token);
+
+    // Clear out any leftover bracket orders (stop/target) from a previous
+    // trade before placing this one, so reversing or re-entering never
+    // leaves orphaned working orders sitting on the account.
+    await cancelOpenOrdersForContract(token, accountId, contract.id);
 
     // Convert dollar risk into ticks using the contract's LIVE tick value,
     // so this stays correct even if the contract multiplier ever changes.
